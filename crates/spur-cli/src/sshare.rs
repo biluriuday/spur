@@ -78,8 +78,18 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         total_shares
     };
 
+    // Build lookup maps from entries (server guarantees one entry per user+account)
+    let mut account_cpu_hours: std::collections::HashMap<&str, f64> =
+        std::collections::HashMap::new();
+    let mut user_account_cpu_hours: std::collections::HashMap<(&str, &str), f64> =
+        std::collections::HashMap::new();
+    for entry in &usage.entries {
+        *account_cpu_hours.entry(&entry.account).or_default() += entry.cpu_hours;
+        user_account_cpu_hours.insert((&entry.user, &entry.account), entry.cpu_hours);
+    }
+
     // Compute total usage for normalization
-    let total_cpu_usage: f64 = usage.cpu_hours.values().sum();
+    let total_cpu_usage: f64 = account_cpu_hours.values().sum();
     let total_cpu_usage = if total_cpu_usage <= 0.0 {
         1.0
     } else {
@@ -119,7 +129,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
         let raw_shares = account.fairshare_weight;
         let norm_shares = raw_shares / total_shares;
-        let raw_usage = usage.cpu_hours.get(&account.name).copied().unwrap_or(0.0);
+        let raw_usage = account_cpu_hours
+            .get(account.name.as_str())
+            .copied()
+            .unwrap_or(0.0);
         let norm_usage = raw_usage / total_cpu_usage;
         let fair_share = if norm_usage > 0.001 {
             norm_shares / norm_usage
@@ -159,7 +172,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 }
             }
 
-            let user_usage = usage.cpu_hours.get(&user.name).copied().unwrap_or(0.0);
+            let user_usage = user_account_cpu_hours
+                .get(&(user.name.as_str(), account.name.as_str()))
+                .copied()
+                .unwrap_or(0.0);
             let user_norm_usage = user_usage / total_cpu_usage;
             // Each user within an account gets an equal sub-share
             let user_count = account_users.len().max(1) as f64;

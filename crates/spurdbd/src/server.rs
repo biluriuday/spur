@@ -9,7 +9,7 @@ use spur_proto::proto::*;
 #[allow(unused_imports)]
 use tracing::info;
 
-use crate::db;
+use crate::{db, fairshare};
 
 pub struct AccountingService {
     pool: PgPool,
@@ -207,22 +207,29 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut cpu_hours = std::collections::HashMap::new();
-        let mut gpu_hours = std::collections::HashMap::new();
-        let mut job_count = std::collections::HashMap::new();
-
+        let mut agg: std::collections::HashMap<(String, String), (f64, f64, u64)> =
+            std::collections::HashMap::new();
         for r in &records {
-            let key = format!("{}:{}", r.user_name, r.account);
-            *cpu_hours.entry(key.clone()).or_insert(0.0) += r.cpu_seconds as f64 / 3600.0;
-            *gpu_hours.entry(key.clone()).or_insert(0.0) += r.gpu_seconds as f64 / 3600.0;
-            *job_count.entry(key).or_insert(0u64) += r.job_count;
+            let e = agg
+                .entry((r.user_name.clone(), r.account.clone()))
+                .or_default();
+            e.0 += r.cpu_seconds as f64 / 3600.0;
+            e.1 += r.gpu_seconds as f64 / 3600.0;
+            e.2 += r.job_count;
         }
 
-        Ok(Response::new(GetUsageResponse {
-            cpu_hours,
-            gpu_hours,
-            job_count,
-        }))
+        let entries = agg
+            .into_iter()
+            .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
+                user,
+                account,
+                cpu_hours: cpu,
+                gpu_hours: gpu,
+                job_count: jobs,
+            })
+            .collect();
+
+        Ok(Response::new(GetUsageResponse { entries }))
     }
 
     // ============================================================
@@ -416,6 +423,52 @@ impl SlurmAccounting for AccountingService {
             .collect();
 
         Ok(Response::new(ListQosResponse { qos_list }))
+    }
+
+    // ============================================================
+    // Fairshare
+    // ============================================================
+
+    async fn get_fairshare_factors(
+        &self,
+        request: Request<GetFairshareFactorsRequest>,
+    ) -> Result<Response<GetFairshareFactorsResponse>, Status> {
+        let req = request.into_inner();
+        let halflife_days = if req.halflife_days == 0 {
+            14
+        } else {
+            req.halflife_days.clamp(1, 365)
+        };
+
+        let now = Utc::now();
+        let since = now - chrono::Duration::days(halflife_days as i64 * 4);
+
+        let usage = db::get_usage(&self.pool, None, None, since)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let accounts = db::list_accounts(&self.pool)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let account_weights: std::collections::HashMap<String, f64> = accounts
+            .into_iter()
+            .map(|a| (a.name, a.fairshare_weight as f64))
+            .collect();
+
+        let raw_factors =
+            fairshare::compute_fairshare(&usage, &account_weights, halflife_days, now);
+
+        let entries = raw_factors
+            .into_iter()
+            .map(|((user, account), factor)| FairshareEntry {
+                user,
+                account,
+                factor,
+            })
+            .collect();
+
+        Ok(Response::new(GetFairshareFactorsResponse { entries }))
     }
 }
 
