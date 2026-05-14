@@ -1004,9 +1004,8 @@ ctest_ship() {
     done
 }
 
-# Submit a container job pinned to the controller node (mi300).
 ctest_sbatch() {
-    "${SPUR}/sbatch" --container-image="$CTEST_IMG" -w mi300 "$@" 2>/dev/null | awk '{print $NF}'
+    "${SPUR}/sbatch" --container-image="$CTEST_IMG" "$@" 2>/dev/null | awk '{print $NF}'
 }
 
 # Check exit code of a completed job
