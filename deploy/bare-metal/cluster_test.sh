@@ -893,7 +893,14 @@ else
 fi
 
 LOCAL_INF=$(cat /tmp/spur-infer-$$.out 2>/dev/null || true)
-REMOTE_INF=$(remote_out "/tmp/spur-infer-$$.out")
+
+# Poll for remote output (mi300-2 may still be flushing)
+REMOTE_INF=""
+for _poll in $(seq 1 30); do
+    REMOTE_INF=$(remote_out "/tmp/spur-infer-$$.out")
+    if echo "${REMOTE_INF}" | grep -q "INFERENCE_OK"; then break; fi
+    sleep 1
+done
 
 expect_output "inference: node0 INFERENCE_OK" "INFERENCE_OK" "/tmp/spur-infer-$$.out"
 
@@ -911,7 +918,6 @@ echo -n "TEST ${TOTAL}: inference: throughput reported on both nodes ... "
 LOCAL_TP=$(echo "${LOCAL_INF}" | grep -c "Throughput:" || true)
 REMOTE_TP=$(echo "${REMOTE_INF}" | grep -c "Throughput:" || true)
 if [ "${LOCAL_TP}" -ge 1 ] && [ "${REMOTE_TP}" -ge 1 ]; then
-    # Print the numbers so they're visible in CI logs
     echo "PASS"
     echo "    node0: $(echo "${LOCAL_INF}"  | grep Throughput:)"
     echo "    node1: $(echo "${REMOTE_INF}" | grep Throughput:)"
@@ -998,9 +1004,9 @@ ctest_ship() {
     done
 }
 
-# Submit a container job (no node pin — scheduler picks any agent)
+# Submit a container job pinned to the controller node (mi300).
 ctest_sbatch() {
-    "${SPUR}/sbatch" --container-image="$CTEST_IMG" "$@" 2>/dev/null | awk '{print $NF}'
+    "${SPUR}/sbatch" --container-image="$CTEST_IMG" -w mi300 "$@" 2>/dev/null | awk '{print $NF}'
 }
 
 # Check exit code of a completed job
