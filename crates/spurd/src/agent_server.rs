@@ -384,6 +384,10 @@ impl SlurmAgent for AgentService {
         let job_id = req.job_id;
         let peer_nodes = req.peer_nodes;
         let task_offset = req.task_offset;
+        // Per-task array identity is controller-assigned on the launch request,
+        // not part of the (user-supplied) job spec.
+        let array_job_id = req.array_job_id;
+        let array_task_id = req.array_task_id;
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
@@ -429,6 +433,15 @@ impl SlurmAgent for AgentService {
         }
         if !req.target_node.is_empty() {
             env.insert("SPUR_TARGET_NODE".into(), req.target_node.clone());
+        }
+
+        // Array task identity for scripts. Gate on array_job_id (0 = not an
+        // array; job ids start at 1) since task index 0 is legitimate.
+        if array_job_id != 0 {
+            env.insert("SLURM_ARRAY_TASK_ID".into(), array_task_id.to_string());
+            env.insert("SLURM_ARRAY_JOB_ID".into(), array_job_id.to_string());
+            env.insert("SPUR_ARRAY_TASK_ID".into(), array_task_id.to_string());
+            env.insert("SPUR_ARRAY_JOB_ID".into(), array_job_id.to_string());
         }
 
         // Burst buffer: pass via env var so executor can wrap the script

@@ -85,6 +85,10 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             continue;
         }
 
+        // Finalize never-satisfiable deps before pending_jobs() so they drop
+        // out of this cycle instead of sitting PENDING forever.
+        cluster.cancel_unsatisfiable_dependency_jobs();
+
         let pending = cluster.pending_jobs();
         if pending.is_empty() {
             continue;
@@ -640,6 +644,9 @@ async fn dispatch_to_agent(
             peer_nodes: params.peer_nodes.to_vec(),
             task_offset: params.task_offset,
             target_node: params.target_node.to_string(),
+            // Controller-assigned at array expansion; consumed agent-side.
+            array_job_id: spec.array_job_id.unwrap_or(0),
+            array_task_id: spec.array_task_id.unwrap_or(0),
         })
         .await?;
 

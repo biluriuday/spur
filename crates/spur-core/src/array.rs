@@ -10,7 +10,47 @@
 //! - `0-10:2` — tasks 0,2,4,6,8,10 (step of 2)
 //! - `1-5,10-15` — combination
 
+use crate::job::JobState;
 use thiserror::Error;
+
+/// Aggregate an array job's state from its task states (Slurm parity for
+/// `scontrol show job <array_job_id>` and array-parent dependency resolution).
+///
+/// `None` while any task is non-terminal (or the slice is empty). Once all
+/// tasks are terminal: `Completed` iff all completed, else the worst terminal
+/// state by [`Failed > Deadline > NodeFail > Timeout > Cancelled`].
+pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
+    if task_states.is_empty() {
+        return None;
+    }
+    // Still running/pending/etc. — array not finished.
+    if task_states.iter().any(|s| !s.is_terminal()) {
+        return None;
+    }
+    if task_states.iter().all(|s| *s == JobState::Completed) {
+        return Some(JobState::Completed);
+    }
+    // Worst-state precedence. Exhaustive (no catch-all) so a new JobState can't
+    // be silently swallowed at rank 0, masking a failure.
+    let rank = |s: &JobState| match s {
+        JobState::Failed => 5,
+        JobState::Deadline => 4,
+        JobState::NodeFail => 3,
+        JobState::Timeout => 2,
+        JobState::Cancelled => 1,
+        JobState::Completed
+        | JobState::Pending
+        | JobState::Running
+        | JobState::Completing
+        | JobState::Suspended
+        | JobState::Preempted => 0,
+    };
+    task_states
+        .iter()
+        .filter(|s| **s != JobState::Completed)
+        .max_by_key(|s| rank(s))
+        .copied()
+}
 
 #[derive(Debug, Clone)]
 pub struct ArraySpec {
@@ -162,5 +202,90 @@ mod tests {
     #[test]
     fn test_zero_step_fails() {
         assert!(parse_array_spec("0-10:0").is_err());
+    }
+
+    // ── aggregate_array_state ────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_empty_is_none() {
+        assert_eq!(aggregate_array_state(&[]), None);
+    }
+
+    #[test]
+    fn test_aggregate_unfinished_is_none() {
+        // Any non-terminal task means the array is not finished.
+        assert_eq!(
+            aggregate_array_state(&[JobState::Completed, JobState::Running]),
+            None
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Pending, JobState::Completed]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_aggregate_all_completed() {
+        assert_eq!(
+            aggregate_array_state(&[
+                JobState::Completed,
+                JobState::Completed,
+                JobState::Completed
+            ]),
+            Some(JobState::Completed)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_mixed_failure_wins() {
+        // Failure outranks completion.
+        assert_eq!(
+            aggregate_array_state(&[JobState::Completed, JobState::Failed]),
+            Some(JobState::Failed)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_precedence_failed_over_others() {
+        // Failed > NodeFail > Timeout > Cancelled.
+        assert_eq!(
+            aggregate_array_state(&[
+                JobState::Cancelled,
+                JobState::Timeout,
+                JobState::NodeFail,
+                JobState::Failed,
+            ]),
+            Some(JobState::Failed)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Timeout, JobState::NodeFail]),
+            Some(JobState::NodeFail)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Timeout]),
+            Some(JobState::Timeout)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Cancelled]),
+            Some(JobState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_deadline_outranks_cancellation() {
+        // A deadline-failed task must not be masked by a Cancelled sibling.
+        // Failed > Deadline > NodeFail > Timeout > Cancelled.
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Deadline]),
+            Some(JobState::Deadline)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Completed, JobState::Deadline]),
+            Some(JobState::Deadline)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Deadline, JobState::Failed]),
+            Some(JobState::Failed)
+        );
     }
 }
