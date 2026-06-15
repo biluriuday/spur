@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use spur_core::accounting::{Qos, TresRecord, TresType};
@@ -55,6 +56,8 @@ pub struct ClusterManager {
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
+    /// Wake signal for the scheduler loop.
+    pub(crate) scheduler_notify: Arc<Notify>,
 }
 
 impl ClusterManager {
@@ -76,6 +79,7 @@ impl ClusterManager {
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
+            scheduler_notify: Arc::new(Notify::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -112,6 +116,8 @@ impl ClusterManager {
                 spec: Box::new(task_spec),
             })?;
         }
+
+        self.scheduler_notify.notify_one();
 
         info!(job_id, "job submitted");
         Ok(job_id)
@@ -5124,5 +5130,63 @@ mod tests {
         let node = cm.get_node("gpu-node").unwrap();
         assert_eq!(node.features, vec!["mi300x", "rocm6"]);
         assert_eq!(node.weight, 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_triggers_scheduler_notify() {
+        // Verify that submit_job() actually calls notify_one() in production code path.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Set up a listener before submitting
+        let notify = cm.scheduler_notify.clone();
+        let listener = tokio::spawn(async move {
+            notify.notified().await;
+        });
+
+        // Give listener time to register
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+
+        // Submit a job - this should trigger notify_one()
+        let spec = basic_spec("test");
+        let _ = submit_and_wait(&cm, spec);
+
+        // Verify notification was received (with timeout to prevent hanging)
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), listener).await;
+
+        assert!(
+            result.is_ok(),
+            "submit_job should call notify_one() to wake scheduler"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_notifies_even_with_array_expansion() {
+        // Array jobs expand into multiple tasks; verify notify is called during expansion.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Set up a listener before submitting
+        let notify = cm.scheduler_notify.clone();
+        let listener = tokio::spawn(async move {
+            notify.notified().await;
+        });
+
+        // Submit an array job (expands to multiple tasks). `submit_job` returns the
+        // array parent id, which is not stored — only per-task ids exist in `jobs`.
+        let mut spec = basic_spec("array");
+        spec.array_spec = Some("0-2".into()); // Creates 3 tasks
+        let parent_id = cm.submit_job(spec).unwrap();
+        let first_task_id = parent_id + 1;
+        wait_for(&format!("array task {first_task_id} applied"), || {
+            cm.get_job(first_task_id).is_some()
+        });
+
+        // Verify notification was received (with timeout to prevent hanging)
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(1), listener).await;
+        assert!(
+            result.is_ok(),
+            "array job submission should trigger scheduler notification"
+        );
     }
 }
