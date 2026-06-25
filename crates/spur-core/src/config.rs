@@ -76,6 +76,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub licenses: HashMap<String, u64>,
 
+    /// Cluster-wide burst-buffer capacity pool.
+    #[serde(default)]
+    pub burst_buffer: BurstBufferConfig,
+
     /// Auto-update configuration.
     #[serde(default)]
     pub update: UpdateConfig,
@@ -593,6 +597,21 @@ pub struct NotificationConfig {
     pub smtp_command: Option<String>,
     /// From address for notification emails, e.g., "spur@cluster.local".
     pub from_address: Option<String>,
+}
+
+/// Cluster-wide burst-buffer capacity, modeled like a single consumable pool
+/// (analogous to a license total). Jobs reserve GB via `--bb capacity=NNN`.
+///
+/// ```toml
+/// [burst_buffer]
+/// total_gb = 1024
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct BurstBufferConfig {
+    /// Total burst-buffer capacity in gibibytes. 0 (default) disables BB: any
+    /// job requesting capacity stays pending with `BurstBufferResources`.
+    #[serde(default)]
+    pub total_gb: u64,
 }
 
 /// Job isolation configuration for native-host and container jobs.
