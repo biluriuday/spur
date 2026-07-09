@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{DateTime, Utc};
+use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
 
 /// Run database migrations (create tables if they don't exist).
@@ -127,6 +128,7 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
 pub async fn record_job_start(
     pool: &PgPool,
     job_id: i32,
+    name: &str,
     user: &str,
     account: &str,
     partition: &str,
@@ -134,27 +136,35 @@ pub async fn record_job_start(
     num_tasks: i32,
     cpus_per_task: i32,
     memory_mb: i64,
+    submit_time: DateTime<Utc>,
     start_time: DateTime<Utc>,
     reservation: &str,
 ) -> anyhow::Result<()> {
+    // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, start_time, state, reservation)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'RUNNING', $10)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'RUNNING', $12)
         ON CONFLICT (job_id) DO UPDATE SET
-            user_name = $2,
-            account = $3,
-            partition_name = $4,
-            num_nodes = $5,
-            num_tasks = $6,
-            cpus_per_task = $7,
-            memory_mb = $8,
-            start_time = $9,
-            state = 'RUNNING',
-            reservation = $10
+            name = EXCLUDED.name,
+            user_name = EXCLUDED.user_name,
+            account = EXCLUDED.account,
+            partition_name = EXCLUDED.partition_name,
+            num_nodes = EXCLUDED.num_nodes,
+            num_tasks = EXCLUDED.num_tasks,
+            cpus_per_task = EXCLUDED.cpus_per_task,
+            memory_mb = EXCLUDED.memory_mb,
+            submit_time = EXCLUDED.submit_time,
+            start_time = EXCLUDED.start_time,
+            state = EXCLUDED.state,
+            exit_code = 0,
+            exit_signal = 0,
+            derived_exit_code = 0,
+            end_time = NULL
         "#,
     )
     .bind(job_id)
+    .bind(name)
     .bind(user)
     .bind(account)
     .bind(partition)
@@ -162,6 +172,7 @@ pub async fn record_job_start(
     .bind(num_tasks)
     .bind(cpus_per_task)
     .bind(memory_mb)
+    .bind(submit_time)
     .bind(start_time)
     .bind(reservation)
     .execute(pool)
@@ -169,14 +180,16 @@ pub async fn record_job_start(
 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
-    let end_time: Option<DateTime<Utc>> =
-        sqlx::query_scalar("SELECT end_time FROM jobs WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await?;
+    let row = sqlx::query(
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
 
+    let end_time: Option<DateTime<Utc>> = row.get("end_time");
     if let Some(end_time) = end_time {
-        update_usage(pool, job_id, end_time).await?;
+        update_usage(pool, row, end_time).await?;
     }
 
     Ok(())
@@ -193,7 +206,8 @@ pub async fn record_job_end(
     exit_signal: i32,
     derived_exit_code: i32,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
+    let row = sqlx::query(
         r#"
         INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code)
         VALUES ($1, '', $2, $3, $4, $5, $6)
@@ -203,6 +217,7 @@ pub async fn record_job_end(
             end_time = $4,
             exit_signal = $5,
             derived_exit_code = $6
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task
         "#,
     )
     .bind(job_id)
@@ -211,27 +226,16 @@ pub async fn record_job_end(
     .bind(end_time)
     .bind(exit_signal)
     .bind(derived_exit_code)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
 
-    update_usage(pool, job_id, end_time).await?;
+    update_usage(pool, row, end_time).await?;
 
     Ok(())
 }
 
-/// Update usage accounting for a completed job.
-async fn update_usage(pool: &PgPool, job_id: i32, end_time: DateTime<Utc>) -> anyhow::Result<()> {
-    let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task FROM jobs WHERE job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(());
-    };
-
+/// Update usage accounting for a completed job, from the row `record_job_end` just wrote.
+async fn update_usage(pool: &PgPool, row: PgRow, end_time: DateTime<Utc>) -> anyhow::Result<()> {
     let user: String = row.get("user_name");
     let account: String = row.get("account");
     let start_time: Option<DateTime<Utc>> = row.get("start_time");
@@ -782,6 +786,7 @@ mod job_history_tests {
         record_job_start(
             &pool,
             id0,
+            "job-a",
             &user_a,
             &account_one,
             "debug",
@@ -789,6 +794,7 @@ mod job_history_tests {
             1,
             1,
             0,
+            t1,
             t1,
             "",
         )
@@ -798,6 +804,7 @@ mod job_history_tests {
         record_job_start(
             &pool,
             id1,
+            "job-b",
             &user_b,
             &account_one,
             "debug",
@@ -805,6 +812,7 @@ mod job_history_tests {
             1,
             1,
             0,
+            t1,
             t1,
             "",
         )
@@ -814,6 +822,7 @@ mod job_history_tests {
         record_job_start(
             &pool,
             id2,
+            "job-c",
             &user_a,
             &account_two,
             "debug",
@@ -821,6 +830,7 @@ mod job_history_tests {
             1,
             1,
             0,
+            t2,
             t2,
             "",
         )
@@ -877,6 +887,61 @@ mod job_history_tests {
         assert_eq!(limited[0].job_id, id2);
 
         delete_jobs(&pool, &ids).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn record_job_start_overwrites_reused_job_id() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let id = test_job_id(3);
+        delete_jobs(&pool, &[id]).await.ok();
+
+        let submit1 = Utc::now() - Duration::hours(3);
+        let start1 = Utc::now() - Duration::hours(2);
+        record_job_start(
+            &pool, id, "old-job", "root", "acct-old", "debug", 2, 4, 2, 8192, submit1, start1, "",
+        )
+        .await?;
+        record_job_end(
+            &pool,
+            id,
+            "FAILED",
+            137,
+            start1 + Duration::minutes(5),
+            9,
+            137,
+        )
+        .await?;
+
+        let submit2 = Utc::now() - Duration::minutes(90);
+        let start2 = Utc::now() - Duration::hours(1);
+        record_job_start(
+            &pool, id, "new-job", "vm", "acct-new", "gpu", 1, 1, 1, 1024, submit2, start2, "",
+        )
+        .await?;
+
+        let history = get_job_history(&pool, None, None, None, None, &[], 100)
+            .await?
+            .into_iter()
+            .find(|r| r.job_id == id)
+            .expect("reused job_id should still be queryable");
+        assert_eq!(history.name, "new-job");
+        assert_eq!(history.user_name, "vm");
+        assert_eq!(history.account, "acct-new");
+        assert_eq!(history.partition, "gpu");
+        assert_eq!(history.state, "RUNNING");
+        assert_eq!(history.exit_code, 0);
+        assert_eq!(history.exit_signal, 0);
+        assert_eq!(history.derived_exit_code, 0);
+        assert!(history.end_time.is_none());
+        assert_eq!(
+            history.submit_time.timestamp(),
+            submit2.timestamp(),
+            "submit_time must not carry over from the previous job"
+        );
+
+        delete_jobs(&pool, &[id]).await?;
         Ok(())
     }
 

@@ -9,6 +9,7 @@ use spur_core::job::{JobId, JobState};
 
 pub struct JobStartRecord {
     pub job_id: JobId,
+    pub name: String,
     pub user: String,
     pub account: String,
     pub partition: String,
@@ -16,6 +17,7 @@ pub struct JobStartRecord {
     pub num_tasks: u32,
     pub cpus_per_task: u32,
     pub memory_mb: u64,
+    pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
     pub reservation: Option<String>,
 }
@@ -32,6 +34,7 @@ impl AccountingNotifier {
     pub fn notify_job_start(&self, record: JobStartRecord) {
         let pool = self.pool.clone();
         let job_id = record.job_id;
+        let name = record.name;
         let user = record.user;
         let account = record.account;
         let partition = record.partition;
@@ -39,12 +42,14 @@ impl AccountingNotifier {
         let num_tasks = record.num_tasks as i32;
         let cpus_per_task = record.cpus_per_task as i32;
         let memory_mb = record.memory_mb as i64;
+        let submit_time = record.submit_time;
         let start_time = record.start_time;
         let reservation = record.reservation.unwrap_or_default();
         tokio::spawn(async move {
             if let Err(e) = super::db::record_job_start(
                 &pool,
                 job_id as i32,
+                &name,
                 &user,
                 &account,
                 &partition,
@@ -52,6 +57,7 @@ impl AccountingNotifier {
                 num_tasks,
                 cpus_per_task,
                 memory_mb,
+                submit_time,
                 start_time,
                 &reservation,
             )
