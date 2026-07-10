@@ -43,6 +43,11 @@ use crate::container::ContainerConfig;
 /// Cgroup root for slurmd-managed jobs.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 
+/// Node-local spool root for spurd's per-job scratch (job script, namespace
+/// wrapper). Deliberately off the user's work_dir so these root-side writes
+/// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
+const SPOOL_ROOT: &str = "/var/spool/spur";
+
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
     pub rootfs: PathBuf,
@@ -268,7 +273,7 @@ async fn spawn_job_process(
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
     // the job can still run; absolute output paths in the spec are unaffected.
-    let effective_work_dir: String = if tokio::fs::create_dir_all(work_dir).await.is_ok() {
+    let effective_work_dir: String = if create_dir_as_user(Path::new(work_dir), uid, gid) {
         work_dir.to_string()
     } else {
         warn!(
@@ -291,31 +296,15 @@ async fn spawn_job_process(
     };
     let script = script.as_str();
 
-    // Write script to temp file
-    let script_path = PathBuf::from(work_dir).join(format!(".spur_job_{}.sh", job_id));
-    tokio::fs::write(&script_path, script)
-        .await
-        .context("failed to write job script")?;
-
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&script_path, perms)?;
-    }
+    // Script + wrapper live in the node-local spool dir, not work_dir (see
+    // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
+    let spool_dir = create_job_spool_dir(job_id, uid, gid).context("create job spool dir")?;
+    let script_path = spool_dir.join("spur_job.sh");
+    write_job_scratch(&script_path, script, uid, gid).context("failed to write job script")?;
 
     // Resolve stdout/stderr paths
     let stdout_resolved = resolve_output_path(stdout_path, job_id, work_dir);
     let stderr_resolved = resolve_output_path(stderr_path, job_id, work_dir);
-
-    // Ensure output directories exist
-    if let Some(parent) = Path::new(&stdout_resolved).parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
-    }
-    if let Some(parent) = Path::new(&stderr_resolved).parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
-    }
 
     // Guard: stdin must not overlap stdout/stderr (truncation would destroy input)
     if !stdin_path.is_empty() {
@@ -333,36 +322,10 @@ async fn spawn_job_process(
         .map(|m| m.eq_ignore_ascii_case("append"))
         .unwrap_or(false);
 
-    let stdout_file = if use_append {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&stdout_resolved)
-            .await
-            .context("failed to open stdout file in append mode")?
-    } else {
-        tokio::fs::File::create(&stdout_resolved)
-            .await
-            .context("failed to create stdout file")?
-    };
-    let stderr_file = if stderr_resolved == stdout_resolved {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&stdout_resolved)
-            .await
-            .context("failed to open stderr file (same as stdout)")?
-    } else if use_append {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&stderr_resolved)
-            .await
-            .context("failed to open stderr file in append mode")?
-    } else {
-        tokio::fs::File::create(&stderr_resolved)
-            .await
-            .context("failed to create stderr file")?
-    };
+    // Opened as the submitting user, not root — see open_job_output.
+    let (stdout_file, stderr_file) =
+        open_job_output(uid, gid, use_append, &stdout_resolved, &stderr_resolved)
+            .context("failed to open job output files")?;
 
     let mut env = environment.clone();
 
@@ -389,15 +352,7 @@ async fn spawn_job_process(
                 "stdin redirection is not supported for container jobs, ignoring"
             );
         }
-        let job = launch_container_job(
-            cfg,
-            ctn,
-            &env,
-            use_append,
-            &stdout_resolved,
-            &stderr_resolved,
-        )
-        .await?;
+        let job = launch_container_job(cfg, ctn, &env, stdout_file, stderr_file).await?;
         return Ok(LaunchResult {
             job,
             stdout_path: stdout_resolved,
@@ -410,19 +365,14 @@ async fn spawn_job_process(
     // Issue #99: If root, wrap job with namespace isolation.
     let use_namespaces = nix::unistd::geteuid().is_root();
     let (launch_cmd, launch_args) = if use_namespaces {
-        let wrapper_path = PathBuf::from(work_dir).join(format!(".spur_ns_{}.sh", job_id));
+        let wrapper_path = spool_dir.join("spur_ns.sh");
         let visible_devices = cfg
             .host_device_plan
             .as_ref()
             .map(|p| p.visible_devices.as_slice())
             .unwrap_or(&[]);
         let wrapper = build_namespace_wrapper(uid, gid, visible_devices, &script_path);
-        tokio::fs::write(&wrapper_path, &wrapper).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
-        }
+        write_job_scratch(&wrapper_path, &wrapper, uid, gid)?;
         debug!(job_id, "namespace isolation wrapper created");
         (
             "/usr/bin/unshare".to_string(),
@@ -469,8 +419,8 @@ async fn spawn_job_process(
     cmd.args(&launch_args)
         .current_dir(work_dir)
         .envs(&env)
-        .stdout(stdout_file.into_std().await)
-        .stderr(stderr_file.into_std().await)
+        .stdout(stdout_file)
+        .stderr(stderr_file)
         .stdin(stdin_stdio)
         // Run the batch process in its own process group (pgid == its pid) so
         // signals can target the whole job tree without touching spurd's group.
@@ -739,6 +689,272 @@ fn get_child_pids(pid: i32) -> Vec<i32> {
         .collect()
 }
 
+/// Whether output file/dir creation must be performed as the submitting user.
+/// Only meaningful when spurd is root and the job targets a non-root user.
+fn should_run_as_user(uid: u32) -> bool {
+    uid > 0 && nix::unistd::geteuid().is_root()
+}
+
+/// A user's credentials with the supplementary group list already resolved.
+struct UserCreds {
+    uid: nix::unistd::Uid,
+    gid: nix::unistd::Gid,
+    groups: Vec<nix::unistd::Gid>,
+}
+
+/// Resolve the user's supplementary groups in the parent, before any fork:
+/// `getpwuid_r`/`getgrouplist` allocate and lock, so they're unsafe between fork
+/// and exec in a multithreaded process. Leaves the child only async-signal-safe
+/// syscalls (`apply_user_creds`). Falls back to the primary gid if unresolved.
+fn resolve_user_creds(uid: u32, gid: u32) -> UserCreds {
+    let gid = nix::unistd::Gid::from_raw(gid);
+    let groups = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .and_then(|u| std::ffi::CString::new(u.name).ok())
+        .and_then(|name| nix::unistd::getgrouplist(&name, gid).ok())
+        .unwrap_or_else(|| vec![gid]);
+    UserCreds {
+        uid: nix::unistd::Uid::from_raw(uid),
+        gid,
+        groups,
+    }
+}
+
+/// Drop to the submitting user in a forked child using pre-resolved credentials.
+/// Groups before gid before uid, since each drop removes the privilege the prior
+/// step needs. Only setgroups/setgid/setuid run here — all async-signal-safe.
+fn apply_user_creds(creds: &UserCreds) -> nix::Result<()> {
+    nix::unistd::setgroups(&creds.groups)?;
+    nix::unistd::setgid(creds.gid)?;
+    nix::unistd::setuid(creds.uid)?;
+    Ok(())
+}
+
+/// Open a single output file, creating parent directories. Runs in whatever
+/// credentials the caller holds — as the submitting user when invoked from the
+/// forked helper.
+fn open_output_file(path: &str, use_append: bool) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true);
+    if use_append {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    opts.open(path)
+}
+
+/// Send file descriptors to a peer over a Unix socket via SCM_RIGHTS.
+fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    let iov = [std::io::IoSlice::new(b"F")];
+    let cmsgs = [ControlMessage::ScmRights(fds)];
+    sendmsg::<()>(sock, &iov, &cmsgs, MsgFlags::empty(), None)?;
+    Ok(())
+}
+
+/// Receive file descriptors sent via SCM_RIGHTS. Returns an empty vec if the
+/// peer closed without sending (e.g. the helper failed before passing fds).
+fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
+    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
+    let mut buf = [0u8; 8];
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let mut cmsg = nix::cmsg_space!([RawFd; 2]);
+    let msg = recvmsg::<()>(sock, &mut iov, Some(&mut cmsg), MsgFlags::empty())?;
+    let mut fds = Vec::new();
+    for cmsg in msg.cmsgs()? {
+        if let ControlMessageOwned::ScmRights(received) = cmsg {
+            for fd in received {
+                fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+    Ok(fds)
+}
+
+/// Open a job's stdout/stderr, creating parent directories.
+///
+/// When spurd is root and the job targets a non-root user, a forked child drops
+/// to the user's credentials before touching the filesystem and passes the open
+/// fds back over a socketpair. Resolving paths as the user (not root) is what
+/// prevents a job from coercing root into creating, truncating, or owning files
+/// outside the user's reach; it also makes the files user-owned without a chown.
+/// Otherwise the files are opened in-process.
+fn open_job_output(
+    uid: u32,
+    gid: u32,
+    use_append: bool,
+    stdout_path: &str,
+    stderr_path: &str,
+) -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    // When stderr follows stdout (same resolved path, e.g. `srun -o` with no
+    // `-e`), stderr must share stdout's open file description via dup so both
+    // streams advance a single shared write offset and interleave correctly.
+    // Opening the path a second time would give stderr an independent offset,
+    // and subsequent stdout writes would clobber whatever stderr wrote.
+    let shared = stderr_path == stdout_path;
+
+    if !should_run_as_user(uid) {
+        let out = open_output_file(stdout_path, use_append).context("open stdout")?;
+        let err = if shared {
+            out.try_clone().context("clone stdout fd for stderr")?
+        } else {
+            open_output_file(stderr_path, use_append).context("open stderr")?
+        };
+        return Ok((out, err));
+    }
+
+    // Resolve credentials before the fork; see resolve_user_creds.
+    let creds = resolve_user_creds(uid, gid);
+
+    use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+    let (parent_sock, child_sock) = socketpair(
+        AddressFamily::Unix,
+        SockType::Datagram,
+        None,
+        SockFlag::empty(),
+    )
+    .context("socketpair for output fd passing")?;
+
+    match unsafe { nix::unistd::fork().context("fork for output open")? } {
+        nix::unistd::ForkResult::Child => {
+            // CRITICAL: post-fork, so synchronous + async-signal-safe only
+            // (tokio is broken here). _exit skips atexit/stdio flushing that
+            // could deadlock on a lock a sibling thread held at fork time.
+            // Exit codes distinguish failure stages.
+            drop(parent_sock);
+            let code = 'open: {
+                if apply_user_creds(&creds).is_err() {
+                    break 'open 1;
+                }
+                let Ok(out) = open_output_file(stdout_path, use_append) else {
+                    break 'open 2;
+                };
+                // Same fd (dup) when stderr follows stdout; SCM_RIGHTS preserves
+                // the shared open file description, so both land one offset.
+                let err = if shared {
+                    match out.try_clone() {
+                        Ok(f) => f,
+                        Err(_) => break 'open 3,
+                    }
+                } else {
+                    match open_output_file(stderr_path, use_append) {
+                        Ok(f) => f,
+                        Err(_) => break 'open 3,
+                    }
+                };
+                if send_fds(child_sock.as_raw_fd(), &[out.as_raw_fd(), err.as_raw_fd()]).is_err() {
+                    break 'open 4;
+                }
+                0
+            };
+            unsafe { libc::_exit(code) };
+        }
+        nix::unistd::ForkResult::Parent { child } => {
+            drop(child_sock);
+            // Reap first: the helper sends the fds before exiting, and a datagram
+            // socket buffers them past the sender's lifetime, so we can wait for
+            // the exit code and only then read. Recv-first would hang on the
+            // failure path — a closed datagram peer yields no reliable EOF.
+            let status = nix::sys::wait::waitpid(child, None);
+            if !matches!(status, Ok(nix::sys::wait::WaitStatus::Exited(_, 0))) {
+                bail!("output helper failed to open job output (status: {status:?})");
+            }
+            let fds =
+                recv_fds(parent_sock.as_raw_fd()).context("receive output fds from helper")?;
+            if fds.len() != 2 {
+                bail!("output helper returned {} fds, expected 2", fds.len());
+            }
+            let mut it = fds.into_iter();
+            let out = std::fs::File::from(it.next().unwrap());
+            let err = std::fs::File::from(it.next().unwrap());
+            Ok((out, err))
+        }
+    }
+}
+
+/// Create `dir` and any missing parents as the submitting user (forking to drop
+/// privilege when spurd is root), so directory creation resolves symlinks and
+/// permissions with the user's authority. Returns whether the tree now exists.
+fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
+    if !should_run_as_user(uid) {
+        return std::fs::create_dir_all(dir).is_ok();
+    }
+    // Resolve credentials before the fork; see resolve_user_creds.
+    let creds = resolve_user_creds(uid, gid);
+    match unsafe { nix::unistd::fork() } {
+        Ok(nix::unistd::ForkResult::Child) => {
+            // _exit skips atexit/stdio flushing, unsafe in a post-fork child.
+            let ok = apply_user_creds(&creds).is_ok() && std::fs::create_dir_all(dir).is_ok();
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        Ok(nix::unistd::ForkResult::Parent { child }) => {
+            matches!(
+                nix::sys::wait::waitpid(child, None),
+                Ok(nix::sys::wait::WaitStatus::Exited(_, 0))
+            )
+        }
+        Err(_) => false,
+    }
+}
+
+/// Create a node-local spool directory for a job's scratch files. Prefers
+/// `SPOOL_ROOT`; falls back to a temp dir when it isn't writable (e.g. non-root
+/// dev runs). When spurd is root and the job targets a user, the dir is handed
+/// to that user so the job — which runs as the user — can traverse it.
+fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> anyhow::Result<PathBuf> {
+    let mut last_err = None;
+    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+        let dir = base.join(format!("job{}", job_id));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                if should_run_as_user(uid) {
+                    use nix::unistd::{Gid, Uid};
+                    // Path-based chown is safe here: the spool tree is
+                    // root-owned, not user-controlled, so no symlink TOCTOU.
+                    let _ = nix::unistd::chown(
+                        &dir,
+                        Some(Uid::from_raw(uid)),
+                        Some(Gid::from_raw(gid)),
+                    );
+                }
+                return Ok(dir);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    bail!("failed to create job spool dir: {last_err:?}")
+}
+
+/// Write a scratch file (job script, namespace wrapper) executable. When spurd
+/// is root and the job targets a user, hand ownership to that user and keep the
+/// file private (0700), so only the job and root can read it — matching Slurm's
+/// batch script handling.
+fn write_job_scratch(path: &Path, content: &str, uid: u32, gid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    if should_run_as_user(uid) {
+        use nix::unistd::{Gid, Uid};
+        nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .with_context(|| format!("chown {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove a job's spool directory (best-effort), mirroring Slurm purging its
+/// batchdir after completion. Tries both candidate roots since the fallback
+/// location isn't recorded.
+pub fn cleanup_job_spool(job_id: JobId) {
+    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+        let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
+    }
+}
+
 /// Resolve output path patterns (%j → job_id, etc.)
 fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
     let resolved = if pattern.is_empty() {
@@ -771,32 +987,15 @@ async fn launch_container_job(
     cfg: &JobLaunchConfig,
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
-    use_append: bool,
-    stdout_path: &str,
-    stderr_path: &str,
+    stdout_fd: std::fs::File,
+    stderr_fd: std::fs::File,
 ) -> anyhow::Result<RunningJob> {
     let job_id = cfg.job_id;
     let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
 
-    // Open stdout/stderr files before fork (child will dup2 these)
-    let stdout_fd: std::fs::File = if use_append {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(stdout_path)
-            .context("open stdout for container job")?
-    } else {
-        std::fs::File::create(stdout_path).context("create stdout for container job")?
-    };
-    let stderr_fd: std::fs::File = if use_append {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(stderr_path)
-            .context("open stderr for container job")?
-    } else {
-        std::fs::File::create(stderr_path).context("create stderr for container job")?
-    };
+    // stdout_fd/stderr_fd are already opened as the submitting user by the
+    // caller (open_job_output). The child dup2's these inherited fds directly,
+    // preserving the append/truncate mode set at open time.
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -824,8 +1023,6 @@ async fn launch_container_job(
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS ===
             // CRITICAL: synchronous code only. Tokio runtime is broken after fork.
-            drop(stdout_fd);
-            drop(stderr_fd);
             unsafe {
                 libc::close(ready_r);
             }
@@ -836,14 +1033,11 @@ async fn launch_container_job(
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             }
 
-            // Redirect stdout/stderr
-            let stdout_reopen = std::fs::File::options().append(true).open(stdout_path).ok();
-            let stderr_reopen = std::fs::File::options().append(true).open(stderr_path).ok();
-            if let Some(f) = stdout_reopen.as_ref() {
-                unsafe { libc::dup2(f.as_raw_fd(), libc::STDOUT_FILENO) };
-            }
-            if let Some(f) = stderr_reopen.as_ref() {
-                unsafe { libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO) };
+            // Redirect stdout/stderr to the user-opened output files (inherited
+            // fds), then let close_inherited_fds reap the now-redundant originals.
+            unsafe {
+                libc::dup2(stdout_fd.as_raw_fd(), libc::STDOUT_FILENO);
+                libc::dup2(stderr_fd.as_raw_fd(), libc::STDERR_FILENO);
             }
 
             // Close inherited fds (gRPC sockets, other jobs' files)
@@ -1089,6 +1283,210 @@ mod tests {
             (0, 15)
         );
         assert_eq!(decode_wait_status(WaitStatus::StillAlive), (-1, 0));
+    }
+
+    // These exercise the in-process (non-fork) branch of the helpers: as a
+    // non-root test runner, should_run_as_user() is false, so no privilege drop
+    // or fork happens and behaviour is deterministic regardless of the test uid.
+
+    #[test]
+    fn create_dir_as_user_creates_full_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        assert!(create_dir_as_user(&nested, uid, gid));
+        assert!(nested.is_dir());
+        // Idempotent over an existing tree.
+        assert!(create_dir_as_user(&nested, uid, gid));
+    }
+
+    #[test]
+    fn open_job_output_creates_files_and_parent_dirs() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sub/nested/job.out");
+        let err = dir.path().join("sub/nested/job.err");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let (mut of, mut ef) = open_job_output(
+            uid,
+            gid,
+            false,
+            out.to_str().unwrap(),
+            err.to_str().unwrap(),
+        )
+        .unwrap();
+        of.write_all(b"o").unwrap();
+        ef.write_all(b"e").unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "o");
+        assert_eq!(std::fs::read_to_string(&err).unwrap(), "e");
+    }
+
+    #[test]
+    fn open_job_output_append_preserves_existing_content() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("a.out");
+        let err = dir.path().join("a.err");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let (op, ep) = (out.to_str().unwrap(), err.to_str().unwrap());
+
+        let (mut of, _ef) = open_job_output(uid, gid, false, op, ep).unwrap();
+        of.write_all(b"first\n").unwrap();
+        drop(of);
+
+        let (mut of, _ef) = open_job_output(uid, gid, true, op, ep).unwrap();
+        of.write_all(b"second\n").unwrap();
+        drop(of);
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn open_job_output_truncate_replaces_existing_content() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t.out");
+        let err = dir.path().join("t.err");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let (op, ep) = (out.to_str().unwrap(), err.to_str().unwrap());
+
+        let (mut of, _ef) = open_job_output(uid, gid, false, op, ep).unwrap();
+        of.write_all(b"old content").unwrap();
+        drop(of);
+
+        let (mut of, _ef) = open_job_output(uid, gid, false, op, ep).unwrap();
+        of.write_all(b"new").unwrap();
+        drop(of);
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "new");
+    }
+
+    #[test]
+    fn open_job_output_shared_path_shares_offset() {
+        // `srun -o file` with no `-e` makes stderr follow stdout (same path).
+        // stderr must share stdout's fd (dup) so the two streams advance one
+        // offset and interleave; independent offsets would clobber each other.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("job.out");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let p = shared.to_str().unwrap();
+
+        let (mut of, mut ef) = open_job_output(uid, gid, false, p, p).unwrap();
+        // Interleave: an out write after an err write must not overwrite it.
+        of.write_all(b"out1\n").unwrap();
+        of.flush().unwrap();
+        ef.write_all(b"err1\n").unwrap();
+        ef.flush().unwrap();
+        of.write_all(b"out2\n").unwrap();
+        of.flush().unwrap();
+        ef.write_all(b"err2\n").unwrap();
+        ef.flush().unwrap();
+
+        let contents = std::fs::read_to_string(&shared).unwrap();
+        assert_eq!(
+            contents, "out1\nerr1\nout2\nerr2\n",
+            "streams clobbered: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn write_job_scratch_is_executable_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur_job.sh");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        write_job_scratch(&path, "#!/bin/bash\necho hi\n", uid, gid).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#!/bin/bash\necho hi\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn job_spool_dir_round_trips_create_and_cleanup() {
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        // A job id unlikely to collide with a real job on the test host; as a
+        // non-root runner this resolves to the temp-dir fallback.
+        let job_id: JobId = 987_654_321;
+        let dir = create_job_spool_dir(job_id, uid, gid).unwrap();
+        assert!(dir.is_dir());
+        write_job_scratch(&dir.join("spur_job.sh"), "x", uid, gid).unwrap();
+        cleanup_job_spool(job_id);
+        assert!(!dir.exists());
+    }
+
+    // send_fds/recv_fds are process-agnostic: they pass fds over any Unix
+    // socket. Exercising the SCM_RIGHTS round-trip over an in-process socketpair
+    // covers the fd-passing logic without needing root or a fork.
+    #[test]
+    fn send_recv_fds_round_trips_an_open_file() {
+        use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+        use std::io::{Read, Seek, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passed.txt");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"from-sender").unwrap();
+
+        let (a, b) = socketpair(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+
+        send_fds(a.as_raw_fd(), &[file.as_raw_fd()]).unwrap();
+        let received = recv_fds(b.as_raw_fd()).unwrap();
+        assert_eq!(received.len(), 1);
+
+        // The received fd refers to the same open file description: writes made
+        // through it land in the same file the sender opened.
+        let mut got = std::fs::File::from(received.into_iter().next().unwrap());
+        got.write_all(b"-and-more").unwrap();
+        got.flush().unwrap();
+
+        let mut contents = String::new();
+        file.rewind().unwrap();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "from-sender-and-more");
+    }
+
+    #[test]
+    fn recv_fds_returns_empty_when_no_fds_sent() {
+        use nix::sys::socket::{sendmsg, socketpair, AddressFamily, MsgFlags, SockFlag, SockType};
+
+        let (a, b) = socketpair(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+
+        // A payload with no ancillary data — mirrors a helper that reported
+        // success framing but attached no descriptors.
+        let iov = [std::io::IoSlice::new(b"F")];
+        sendmsg::<()>(a.as_raw_fd(), &iov, &[], MsgFlags::empty(), None).unwrap();
+
+        let received = recv_fds(b.as_raw_fd()).unwrap();
+        assert!(received.is_empty());
     }
 
     #[test]
