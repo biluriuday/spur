@@ -69,6 +69,7 @@ pub struct AgentService {
     spank: Arc<Option<SpankHost>>,
     pmi_servers: Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>,
     hooks: Arc<HooksConfig>,
+    memlock: spur_core::config::MemlockLimit,
     #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
 }
@@ -78,6 +79,7 @@ impl AgentService {
         reporter: Arc<NodeReporter>,
         hooks: HooksConfig,
         device_registry: Arc<Mutex<DeviceRegistry>>,
+        memlock: spur_core::config::MemlockLimit,
     ) -> Self {
         let allocation = NodeAllocation::new(
             hostname::get()
@@ -137,6 +139,7 @@ impl AgentService {
             spank: Arc::new(spank),
             pmi_servers: Arc::new(Mutex::new(HashMap::new())),
             hooks: Arc::new(hooks),
+            memlock,
             device_registry,
         }
     }
@@ -819,6 +822,7 @@ impl SlurmAgent for AgentService {
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
+            memlock: self.memlock,
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
@@ -1046,20 +1050,21 @@ impl SlurmAgent for AgentService {
             cmd.env(k, v);
         }
 
-        // Drop privilege if requested (and we're root). Mirrors the privilege
-        // drop in launch_job's non-namespace path.
-        if req.uid > 0 && nix::unistd::geteuid().is_root() {
-            let target_uid = req.uid;
-            let target_gid = req.gid;
-            unsafe {
-                cmd.pre_exec(move || {
+        let memlock = self.memlock;
+        let drop_privilege = req.uid > 0 && nix::unistd::geteuid().is_root();
+        let target_uid = req.uid;
+        let target_gid = req.gid;
+        unsafe {
+            cmd.pre_exec(move || {
+                crate::executor::apply_memlock(memlock);
+                if drop_privilege {
                     nix::unistd::setgid(nix::unistd::Gid::from_raw(target_gid))
                         .map_err(std::io::Error::other)?;
                     nix::unistd::setuid(nix::unistd::Uid::from_raw(target_uid))
                         .map_err(std::io::Error::other)?;
-                    Ok(())
-                });
-            }
+                }
+                Ok(())
+            });
         }
 
         info!(
@@ -1653,6 +1658,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         let job_id = 100;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
@@ -1703,6 +1709,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         let pid = std::process::id();
         svc.insert_test_job(42, TrackedJob::dummy(pid)).await;
@@ -1722,6 +1729,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
 
         let req = Request::new(ExecInJobRequest {
@@ -1801,6 +1809,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         let req = Request::new(RunCommandRequest {
             command: vec![],
@@ -1820,6 +1829,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         let req = Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hi".into()],
@@ -1839,6 +1849,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         let req = Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hi".into()],
@@ -1883,6 +1894,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
 
         let job_id = 700;
@@ -1937,6 +1949,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         svc.start_monitor("http://127.0.0.1:1".into());
 
@@ -1957,6 +1970,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         svc.start_monitor("http://127.0.0.1:1".into());
 
@@ -2031,6 +2045,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         svc.start_monitor("http://127.0.0.1:1".into());
 
@@ -2062,6 +2077,7 @@ mod tests {
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
         );
         svc.start_monitor("http://127.0.0.1:1".into());
 
