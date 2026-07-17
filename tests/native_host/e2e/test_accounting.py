@@ -10,7 +10,7 @@ when Docker is unavailable).
 import re
 import time
 
-from cluster import parse_job_id, wait_job, wait_sacct_row
+from cluster import deep_merge, parse_job_id, wait_job, wait_sacct_row
 
 
 class TestSacctExitReporting:
@@ -77,4 +77,37 @@ class TestQosLimitReasons:
             time.sleep(2)
         assert reason == "QOSMaxWallDurationPerJobLimit", (
             f"expected QOSMaxWallDurationPerJobLimit, got {reason!r}"
+        )
+
+    def test_cluster_default_qos_binds_and_enforces_no_qos_job(self, accounting_cluster):
+        # A job submitted with no -q must be bound to the configured cluster
+        # fallback QOS and subject to its limits, closing the "omit --qos to
+        # run unenforced" bypass.
+        c = accounting_cluster
+        c.sacctmgr(["add", "qos", "name=capped", "maxwall=1"])
+        # Merge the fallback into the on-disk config, then restart so spurctld
+        # re-reads it (restart_controller alone does not re-render the config).
+        deep_merge(c.config_overrides, {"accounting": {"default_qos": "capped"}})
+        c._write_config()
+        c.restart_controller()
+        time.sleep(15)
+
+        script = c.write_file("nodefault.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "no-qos", "-N", "1", "-t", "60", script])
+        )
+        assert job_id is not None
+
+        show = c.scontrol("show", "job", str(job_id))
+        assert "QOS=capped" in show, f"no-qos job not bound to fallback: {show!r}"
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxWallDurationPerJobLimit":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxWallDurationPerJobLimit", (
+            f"fallback QOS limit not enforced, got {reason!r}"
         )

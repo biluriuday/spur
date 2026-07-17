@@ -364,6 +364,15 @@ pub struct AccountingConfig {
     /// How often to refresh fairshare/QoS caches from the accounting database.
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
+    /// Cluster-wide fallback QOS, applied at submit when a job resolves to no
+    /// QOS. The last link in the resolution chain (Slurm's stock `normal`
+    /// analogue). Empty (default) = no fallback.
+    #[serde(default)]
+    pub default_qos: String,
+    /// Reject at submit any job that still has no QOS after the resolution
+    /// chain. Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false.
+    #[serde(default)]
+    pub require_qos: bool,
 }
 
 fn default_fairshare_refresh_secs() -> u32 {
@@ -375,6 +384,8 @@ impl Default for AccountingConfig {
         Self {
             database_url: String::new(),
             fairshare_refresh_secs: 300,
+            default_qos: String::new(),
+            require_qos: false,
         }
     }
 }
