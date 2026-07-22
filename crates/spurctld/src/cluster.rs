@@ -48,6 +48,9 @@ pub enum NodeCompleteResult {
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
     AlreadyTerminal,
+    /// Report came from a superseded run (older `run_attempt`); ignored so it
+    /// cannot fail a job that has since been requeued and re-dispatched.
+    StaleReport,
 }
 
 /// Reservation CRUD errors for the gRPC boundary.
@@ -743,13 +746,15 @@ impl ClusterManager {
     }
 
     /// Start a job on specific nodes.
+    /// Transition a pending job to Running and record its allocation. Returns
+    /// the run epoch assigned to this dispatch (threaded into the launch RPC).
     pub fn start_job(
         &self,
         job_id: JobId,
         node_names: Vec<String>,
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u32> {
         self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
     }
 
@@ -760,7 +765,7 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u32> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
                 anyhow::bail!(
@@ -775,6 +780,7 @@ impl ClusterManager {
         let old_state;
         let spec_for_notify;
         let submit_time_for_notify;
+        let run_attempt;
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -783,6 +789,8 @@ impl ClusterManager {
             old_state = job.state;
             spec_for_notify = job.spec.clone();
             submit_time_for_notify = job.submit_time;
+            // Next run epoch (first dispatch = 1), threaded to the agents.
+            run_attempt = job.run_attempt.saturating_add(1);
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
@@ -800,6 +808,7 @@ impl ClusterManager {
             resources: resources.clone(),
             per_node_alloc: per_node_alloc.clone(),
             srun_step_dispatch,
+            run_attempt,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -858,7 +867,7 @@ impl ClusterManager {
         }
 
         debug!(job_id, "job started");
-        Ok(())
+        Ok(run_attempt)
     }
 
     /// Record completion from one allocated node (multi-node COMPLETING flow).
@@ -868,6 +877,7 @@ impl ClusterManager {
         node_name: &str,
         exit_code: i32,
         signal: i32,
+        run_attempt: u32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
         {
             let jobs = self.jobs.read();
@@ -876,6 +886,12 @@ impl ClusterManager {
                 .ok_or(NodeCompleteError::JobNotFound { job_id })?;
             if job.state.is_terminal() {
                 return Ok(NodeCompleteResult::AlreadyTerminal);
+            }
+            // Drop a report from a superseded run (older epoch); e.g. the
+            // delayed SIGKILL of a preemption-requeued process. Epoch 0 on
+            // either side (legacy) disables the check.
+            if run_attempt != 0 && job.run_attempt != 0 && run_attempt < job.run_attempt {
+                return Ok(NodeCompleteResult::StaleReport);
             }
             if !job.allocated_nodes.iter().any(|n| n == node_name) {
                 return Err(NodeCompleteError::NodeNotAllocated {
@@ -3356,6 +3372,7 @@ impl ClusterManager {
                 resources,
                 per_node_alloc,
                 srun_step_dispatch,
+                run_attempt,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
@@ -3364,6 +3381,7 @@ impl ClusterManager {
                     job.per_node_alloc = per_node_alloc.clone();
                     job.pending_reason = PendingReason::None;
                     job.srun_step_dispatch = *srun_step_dispatch;
+                    job.run_attempt = *run_attempt;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -4925,6 +4943,7 @@ mod tests {
             resources: resources.clone(),
             per_node_alloc: per_node_for(&["node1"], resources),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -4960,6 +4979,7 @@ mod tests {
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["node1"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -5448,6 +5468,7 @@ mod tests {
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5490,6 +5511,7 @@ mod tests {
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5533,6 +5555,7 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5599,6 +5622,7 @@ mod tests {
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -5692,6 +5716,7 @@ mod tests {
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5743,6 +5768,7 @@ mod tests {
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -5783,6 +5809,7 @@ mod tests {
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -5841,6 +5868,7 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -5849,7 +5877,7 @@ mod tests {
             signal: 0,
         });
 
-        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::Completing);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
     }
@@ -5878,9 +5906,10 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
-        cm.node_complete(1, "n1", 0, 9).unwrap();
+        cm.node_complete(1, "n1", 0, 9, 0).unwrap();
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(0));
@@ -5921,10 +5950,11 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
-        cm.node_complete(1, "n1", 0, 9).unwrap();
+        cm.node_complete(1, "n1", 0, 9, 0).unwrap();
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
@@ -5957,9 +5987,10 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
-        cm.node_complete(1, "n1", 42, 0).unwrap();
+        cm.node_complete(1, "n1", 42, 0, 0).unwrap();
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(42));
@@ -5968,6 +5999,46 @@ mod tests {
         // exit (42) surfaces as ExitCode, not DerivedExitCode.
         assert_eq!(job.derived_exit_code, 0);
         assert_eq!(job.pending_reason, PendingReason::NonZeroExitCode);
+    }
+
+    // A completion report from a superseded run (older epoch) must be dropped,
+    // not fail the re-dispatched run. Reproduces the preempt-requeue race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_drops_stale_run_report() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("stale-job")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+        });
+        // Re-dispatched run: current epoch is 2.
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+
+        // Stale SIGKILL report from epoch 1 must be ignored.
+        let res = cm.node_complete(1, "n1", 0, 9, 1).unwrap();
+        assert!(matches!(res, NodeCompleteResult::StaleReport));
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+
+        // Current-epoch report is applied normally.
+        cm.node_complete(1, "n1", 0, 9, 2).unwrap();
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Failed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5997,6 +6068,7 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -6065,6 +6137,7 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -6076,7 +6149,7 @@ mod tests {
         cm.cancel_job(1, "testuser").unwrap();
         settle(&cm, 1, JobState::Cancelled);
 
-        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::AlreadyTerminal);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Cancelled);
     }
@@ -6416,6 +6489,7 @@ mod tests {
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -6510,6 +6584,7 @@ mod tests {
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -11309,6 +11384,7 @@ mod tests {
             resources: scalar_alloc(1, 1000),
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: false,
+            run_attempt: 0,
         });
     }
 
@@ -11326,6 +11402,7 @@ mod tests {
             resources: scalar_alloc(1, 1000),
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: true,
+            run_attempt: 0,
         });
     }
 

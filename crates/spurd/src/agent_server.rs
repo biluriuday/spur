@@ -44,12 +44,15 @@ struct TrackedJob {
     memory_mb: u64,
     nodelist: String,
     mpi: String,
+    /// Run epoch; echoed on completion and guards the grace-period SIGKILL.
+    run_attempt: u32,
 }
 
 struct CompletedJob {
     job_id: u32,
     exit_code: i32,
     signal: i32,
+    run_attempt: u32,
     rootfs_mode: crate::container::RootfsMode,
     cgroup: Option<std::path::PathBuf>,
     work_dir: String,
@@ -205,6 +208,7 @@ impl AgentService {
                                 job_id: *job_id,
                                 exit_code,
                                 signal,
+                                run_attempt: tracked.run_attempt,
                                 rootfs_mode: tracked.rootfs_mode.clone(),
                                 cgroup,
                                 work_dir: tracked.work_dir.clone(),
@@ -313,6 +317,7 @@ impl AgentService {
                         c.job_id,
                         c.exit_code,
                         c.signal,
+                        c.run_attempt,
                         &local_hostname,
                         drain.as_ref(),
                     )
@@ -368,6 +373,20 @@ mod completion_report_tests {
     fn transient_errors_are_retryable() {
         assert!(completion_report_retryable(&Status::unavailable("x")));
         assert!(completion_report_retryable(&Status::internal("x")));
+    }
+}
+
+/// Reap an already-killed displaced run. Polls `try_wait` so both executor
+/// variants are collected: a `Managed` child via tokio, a `Forked` container's
+/// raw pid via `waitpid`. Once a displaced run leaves the `running` map the
+/// monitor loop no longer polls it, so without this a killed `Forked` run would
+/// linger as a zombie until spurd exits.
+async fn reap_killed_job(mut job: executor::RunningJob) {
+    loop {
+        match job.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
     }
 }
 
@@ -453,6 +472,7 @@ async fn report_completion(
     job_id: u32,
     exit_code: i32,
     signal: i32,
+    run_attempt: u32,
     reporting_node: &str,
     drain: Option<&DrainRequest>,
 ) {
@@ -477,6 +497,7 @@ async fn report_completion(
                     drain_node: drain.is_some(),
                     drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
                     reporting_node: reporting_node.to_string(),
+                    run_attempt,
                 };
                 match client.report_job_status(req).await {
                     Ok(_) => {
@@ -544,6 +565,7 @@ impl SlurmAgent for AgentService {
         // not part of the (user-supplied) job spec.
         let array_job_id = req.array_job_id;
         let array_task_id = req.array_task_id;
+        let run_attempt = req.run_attempt;
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
@@ -898,7 +920,7 @@ impl SlurmAgent for AgentService {
                 // `launching` (which would let reconcile reclaim it).
                 self.allocation.lock().await.commit_job(job_id);
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
-                jobs.insert(
+                let displaced = jobs.insert(
                     job_id,
                     TrackedJob {
                         job: result.job,
@@ -915,8 +937,20 @@ impl SlurmAgent for AgentService {
                         memory_mb: launch_cfg.memory_mb,
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
+                        run_attempt,
                     },
                 );
+                drop(jobs);
+                // Re-dispatch onto the same node reuses job_id and displaces an
+                // older run. If its process ignored SIGTERM and outlived the
+                // requeue, kill and reap it here — the monitor loop no longer
+                // tracks it, so without this it would leak as an orphan/zombie.
+                if let Some(old) = displaced {
+                    if old.run_attempt < run_attempt {
+                        let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                        tokio::spawn(reap_killed_job(old.job));
+                    }
+                }
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
@@ -937,8 +971,16 @@ impl SlurmAgent for AgentService {
                         let drain = DrainRequest {
                             reason: drain_reason.clone(),
                         };
-                        report_completion(&controller, job_id, -1, 0, &node_name, Some(&drain))
-                            .await;
+                        report_completion(
+                            &controller,
+                            job_id,
+                            -1,
+                            0,
+                            run_attempt,
+                            &node_name,
+                            Some(&drain),
+                        )
+                        .await;
                     });
                 }
 
@@ -1119,6 +1161,9 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
+                // srun allocation-only jobs use their own cancel lifecycle;
+                // epoch 0 leaves the stale-report guard disabled for them.
+                run_attempt: 0,
             },
         );
 
@@ -1971,20 +2016,27 @@ impl AgentService {
             return;
         }
 
-        {
+        // Epoch of the run we're cancelling; the delayed SIGKILL below must not
+        // touch a newer run that reused this job_id after a requeue.
+        let cancel_attempt = {
             let jobs = self.running.lock().await;
             let Some(tracked) = jobs.get(&job_id) else {
                 return;
             };
             info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
             let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
-        }
+            tracked.run_attempt
+        };
 
         let running = self.running.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             let jobs = running.lock().await;
             if let Some(tracked) = jobs.get(&job_id) {
+                // Skip if job_id was reused by a newer run after requeue.
+                if tracked.run_attempt != cancel_attempt {
+                    return;
+                }
                 info!(job_id, "grace period expired, sending SIGKILL");
                 let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                 // Job stays in `running` and monitor loop reaps it and does full cleanup.
@@ -2037,6 +2089,7 @@ impl TrackedJob {
             memory_mb: 0,
             nodelist: String::new(),
             mpi: String::new(),
+            run_attempt: 0,
         }
     }
 }
@@ -2617,6 +2670,7 @@ mod tests {
             memory_mb: 0,
             nodelist: String::new(),
             mpi: String::new(),
+            run_attempt: 0,
         };
         svc.insert_test_job(job_id, tracked).await;
 
@@ -2627,6 +2681,86 @@ mod tests {
             wait_job_reaped(&svc, job_id, 10_000).await,
             "monitor should reap job after SIGKILL escalation"
         );
+    }
+
+    // The grace-period SIGKILL must not fire if job_id was reused by a newer
+    // run (epoch bumped) after a requeue. Guards the preempt-requeue race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_cancel_skips_sigkill_for_reused_job_id() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // No monitor: this test asserts the grace timer's epoch guard directly,
+        // so nothing should reap the job out from under it.
+
+        // SIGTERM-trapping process so epoch 1 survives its cancel; built inline
+        // (not via dummy(), which would leak its own sleep child).
+        fn spawn_trap(run_attempt: u32) -> (TrackedJob, i32) {
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn trap process");
+            let pid = child.id().expect("pid") as i32;
+            let t = TrackedJob {
+                job: executor::RunningJob::Managed {
+                    child,
+                    cgroup_path: None,
+                },
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: "/dev/null".into(),
+                stderr_path: "/dev/null".into(),
+                has_pid_namespace: false,
+                work_dir: "/tmp".into(),
+                uid: 0,
+                gid: 0,
+                partition: String::new(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+                nodelist: String::new(),
+                mpi: String::new(),
+                run_attempt,
+            };
+            (t, pid)
+        }
+        let job_id = 902;
+        let (run1, pid1) = spawn_trap(1);
+        svc.insert_test_job(job_id, run1).await;
+
+        // Cancel epoch 1 (SIGTERM; trapped, survives) and spawn the grace timer.
+        svc.graceful_cancel(job_id).await;
+
+        // Simulate requeue + re-dispatch: same job_id, newer epoch.
+        let (run2, pid2) = spawn_trap(2);
+        svc.insert_test_job(job_id, run2).await;
+
+        // Wait past the 5s grace period; the guard must skip the SIGKILL, so the
+        // epoch-2 process stays alive. Assert a live state ('S'/'R'), not mere
+        // /proc existence — a wrongly-killed unreaped child would be a zombie
+        // ('Z'), which still has /proc and would false-pass an existence check.
+        tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+        let state = proc_state(pid2);
+        assert!(
+            matches!(state, 'S' | 'R' | 'D'),
+            "grace-period SIGKILL wrongly killed the re-dispatched run (state {state})"
+        );
+
+        // Cleanup: trap processes ignore SIGTERM; SIGKILL each process group
+        // (negative pid) so the inner sleep child is reaped too.
+        for pid in [pid1, pid2] {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        svc.running.lock().await.remove(&job_id);
     }
 
     fn proc_state(pid: i32) -> char {
@@ -2651,6 +2785,40 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         proc_state(pid)
+    }
+
+    /// A displaced `Forked` run (root/container path) holds a raw pid that
+    /// spurd must reap itself. `reap_killed_job` must collect it via `waitpid`;
+    /// otherwise it lingers as a zombie once it leaves the monitor loop's map.
+    #[tokio::test]
+    async fn reap_killed_job_reaps_forked_variant() {
+        // Fork a child that exits immediately, leaving it unreaped (a zombie)
+        // until something waits on it — exactly the displaced-run situation.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => unsafe { libc::_exit(0) },
+            nix::unistd::ForkResult::Parent { child } => child.as_raw(),
+        };
+
+        // Let the child exit so it is a zombie before we reap it.
+        assert_eq!(
+            await_proc_state(pid, &['Z']).await,
+            'Z',
+            "forked child should be an unreaped zombie before reap_killed_job"
+        );
+
+        let job = executor::RunningJob::Forked {
+            pid,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        reap_killed_job(job).await;
+
+        // After reaping, the pid is gone from the process table entirely.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "reap_killed_job must reap the Forked child (pid {pid} still present)"
+        );
     }
 
     #[tokio::test]
