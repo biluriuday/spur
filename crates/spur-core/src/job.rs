@@ -662,6 +662,15 @@ pub struct Job {
     /// once it completes. A BB job is held off dispatch until `Ready`.
     #[serde(default)]
     pub bb_stage_state: BbStageState,
+
+    /// Absolute path the primary agent resolved at launch (incl. `/tmp` fallback).
+    /// Best-effort advisory: set post-launch, not via WAL replay (may ride along in a
+    /// snapshot). `None` before launch or after a failover that missed it, when
+    /// queries fall back to `resolved_stdout`/`resolved_stderr`.
+    #[serde(default)]
+    pub actual_stdout_path: Option<String>,
+    #[serde(default)]
+    pub actual_stderr_path: Option<String>,
 }
 
 impl Job {
@@ -706,6 +715,8 @@ impl Job {
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
             srun_step_dispatch: false,
+            actual_stdout_path: None,
+            actual_stderr_path: None,
         }
     }
 
@@ -789,7 +800,8 @@ impl Job {
         self.resolve_path(self.spec.stderr_path.as_deref().unwrap_or("spur-%j.out"))
     }
 
-    /// Resolve stdin path, if set.
+    /// Resolve stdin path, if set. Absolute (anchored like stdout/stderr) and
+    /// controller-display-only; the agent resolves stdin itself at launch.
     pub fn resolved_stdin(&self) -> Option<String> {
         self.spec
             .stdin_path
@@ -798,23 +810,103 @@ impl Job {
     }
 
     fn resolve_path(&self, pattern: &str) -> String {
-        let mut result = pattern.to_string();
-        result = result.replace("%j", &self.job_id.to_string());
-        result = result.replace("%J", &self.job_id.to_string());
-        result = result.replace("%x", &self.spec.name);
-        if let Some(tid) = self.spec.array_task_id {
-            result = result.replace("%a", &tid.to_string());
-            result = result.replace(
-                "%A",
-                &self.spec.array_job_id.unwrap_or(self.job_id).to_string(),
-            );
-        }
-        if let Some(node) = self.allocated_nodes.first() {
-            result = result.replace("%N", node);
-        }
-        result = result.replace("%u", &self.spec.user);
-        result
+        resolve_output_pattern(
+            pattern,
+            &OutputPathContext {
+                job_id: self.job_id,
+                name: &self.spec.name,
+                user: &self.spec.user,
+                work_dir: &self.spec.work_dir,
+                node: self.allocated_nodes.first().map(String::as_str),
+                array_job_id: self.spec.array_job_id,
+                array_task_id: self.spec.array_task_id,
+            },
+        )
     }
+}
+
+/// Inputs for expanding Slurm-style output path patterns. Shared by controller
+/// (fallback) and agent (actual) so both resolve the same location — else
+/// `scontrol` shows a path differing from the real output.
+pub struct OutputPathContext<'a> {
+    pub job_id: JobId,
+    pub name: &'a str,
+    pub user: &'a str,
+    pub work_dir: &'a str,
+    /// `%N`: controller passes the primary node, agent its own target (same for primary).
+    pub node: Option<&'a str>,
+    pub array_job_id: Option<JobId>,
+    pub array_task_id: Option<u32>,
+}
+
+/// Fallback work_dir when a job specifies none; the agent launches here, so
+/// path resolution anchors here too.
+pub const DEFAULT_WORK_DIR: &str = "/tmp";
+
+/// Expand `%j`/`%J`/`%x`/`%u`/`%N`/`%a`/`%A` and anchor a relative result to
+/// `work_dir` (or `DEFAULT_WORK_DIR` when empty) so it is absolute, matching
+/// Slurm. An empty pattern defaults to `spur-<id>.out`.
+pub fn resolve_output_pattern(pattern: &str, ctx: &OutputPathContext) -> String {
+    let default;
+    let template: &str = if pattern.is_empty() {
+        default = format!("spur-{}.out", ctx.job_id);
+        &default
+    } else {
+        pattern
+    };
+
+    // Decide anchoring from the raw pattern, not the expanded result: a crafted
+    // job name (`%x`) could otherwise inject a leading `/` and escape work_dir.
+    let anchor = std::path::Path::new(template).is_relative();
+    let expanded = expand_pattern_codes(template, ctx);
+    if !anchor {
+        return expanded;
+    }
+
+    let base = if ctx.work_dir.is_empty() {
+        DEFAULT_WORK_DIR
+    } else {
+        ctx.work_dir
+    };
+    // Join by hand (not `Path::join`, which a substituted leading `/` would
+    // short-circuit) so an injected absolute value still lands under `base`.
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        expanded.trim_start_matches('/')
+    )
+}
+
+/// Single-pass `%`-code expansion. Unlike a chain of `str::replace`, a value
+/// spliced in for one code is never rescanned for a later code. Unknown or
+/// inapplicable codes (`%a`/`%A`/`%N` off an array/node) are left verbatim.
+fn expand_pattern_codes(template: &str, ctx: &OutputPathContext) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('j') | Some('J') => out.push_str(&ctx.job_id.to_string()),
+            Some('x') => out.push_str(ctx.name),
+            Some('u') => out.push_str(ctx.user),
+            Some('a') if ctx.array_task_id.is_some() => {
+                out.push_str(&ctx.array_task_id.unwrap_or_default().to_string());
+            }
+            Some('A') if ctx.array_task_id.is_some() => {
+                out.push_str(&ctx.array_job_id.unwrap_or(ctx.job_id).to_string());
+            }
+            Some('N') if ctx.node.is_some() => out.push_str(ctx.node.unwrap_or_default()),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 /// State transitions.
@@ -969,6 +1061,108 @@ mod tests {
     fn effective_memory_mb_defaults_to_zero_when_unset() {
         let spec = JobSpec::default();
         assert_eq!(effective_memory_mb(&spec, 1), 0);
+    }
+
+    #[test]
+    fn resolved_stdout_default_is_absolute_under_work_dir() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                work_dir: "/home/alice".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/home/alice/spur-7.out");
+        assert_eq!(job.resolved_stderr(), "/home/alice/spur-7.out");
+    }
+
+    #[test]
+    fn resolved_stdout_empty_work_dir_anchors_to_default() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                work_dir: String::new(),
+                ..Default::default()
+            },
+        );
+        // Matches where the agent launches the job, so reported/computed paths agree.
+        assert_eq!(
+            job.resolved_stdout(),
+            format!("{}/spur-7.out", DEFAULT_WORK_DIR)
+        );
+    }
+
+    #[test]
+    fn resolved_stdout_relative_pattern_joined_and_substituted() {
+        let job = Job::new(
+            42,
+            JobSpec {
+                work_dir: "/work".into(),
+                stdout_path: Some("out-%j.log".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/out-42.log");
+    }
+
+    #[test]
+    fn resolved_stdout_absolute_pattern_passes_through() {
+        let job = Job::new(
+            9,
+            JobSpec {
+                work_dir: "/work".into(),
+                stdout_path: Some("/shared/job-%j.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/shared/job-9.out");
+    }
+
+    // A crafted job name must not turn a relative pattern absolute and escape
+    // work_dir: relativity is judged on the pattern, not the substituted value.
+    #[test]
+    fn resolved_stdout_injected_absolute_name_stays_under_work_dir() {
+        let job = Job::new(
+            5,
+            JobSpec {
+                name: "/abs/evil".into(),
+                work_dir: "/work".into(),
+                stdout_path: Some("%x.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/abs/evil.out");
+    }
+
+    // A `%` code appearing inside a substituted value is not re-expanded.
+    #[test]
+    fn resolved_stdout_substituted_value_not_re_expanded() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                name: "%u".into(),
+                user: "bob".into(),
+                work_dir: "/work".into(),
+                stdout_path: Some("%x.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/%u.out");
+    }
+
+    // Absoluteness is guaranteed at submission (CLI cwd, agent /tmp fallback),
+    // not fabricated here: a relative work_dir yields a relative path.
+    #[test]
+    fn resolved_stdout_relative_work_dir_anchored_as_is() {
+        let job = Job::new(
+            3,
+            JobSpec {
+                work_dir: "relwork".into(),
+                stdout_path: Some("out.log".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "relwork/out.log");
     }
 
     #[test]
@@ -1535,9 +1729,16 @@ mod tests {
         job.job_id = 42;
         job.spec.name = "train".into();
         job.spec.user = "bob".into();
+        job.spec.work_dir = "/work".into();
 
-        assert_eq!(job.resolve_path("spur-%j.out"), "spur-42.out");
-        assert_eq!(job.resolve_path("output-%x-%u.log"), "output-train-bob.log");
+        // Relative patterns are anchored to work_dir (absolute), matching Slurm.
+        assert_eq!(job.resolve_path("spur-%j.out"), "/work/spur-42.out");
+        assert_eq!(
+            job.resolve_path("output-%x-%u.log"),
+            "/work/output-train-bob.log"
+        );
+        // Absolute patterns pass through unchanged.
+        assert_eq!(job.resolve_path("/abs/out-%j.log"), "/abs/out-42.log");
     }
 
     #[test]
@@ -1612,10 +1813,12 @@ mod tests {
     fn resolved_stdin_expands_pattern() {
         let spec = JobSpec {
             stdin_path: Some("input-%j.txt".into()),
+            work_dir: "/work".into(),
             ..Default::default()
         };
         let job = Job::new(42, spec);
-        assert_eq!(job.resolved_stdin(), Some("input-42.txt".into()));
+        // Relative stdin is anchored to work_dir, mirroring stdout/stderr.
+        assert_eq!(job.resolved_stdin(), Some("/work/input-42.txt".into()));
     }
 
     #[test]

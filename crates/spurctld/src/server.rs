@@ -2109,8 +2109,14 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         exit_code: job.exit_code.unwrap_or(0),
         exit_signal: job.exit_signal,
         derived_exit_code: job.derived_exit_code,
-        stdout_path: job.resolved_stdout(),
-        stderr_path: job.resolved_stderr(),
+        stdout_path: job
+            .actual_stdout_path
+            .clone()
+            .unwrap_or_else(|| job.resolved_stdout()),
+        stderr_path: job
+            .actual_stderr_path
+            .clone()
+            .unwrap_or_else(|| job.resolved_stderr()),
         stdin_path: job.resolved_stdin().unwrap_or_default(),
         resources: job.allocated_resources.as_ref().map(allocations_to_proto),
         priority: job.priority,
@@ -2386,6 +2392,31 @@ mod tests {
 
         let status = submit_rpc_status(SubmitError::internal("raft propose failed"));
         assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[test]
+    fn job_to_proto_output_path_prefers_actual_else_absolute_computed() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(
+            42,
+            JobSpec {
+                work_dir: "/home/alice".into(),
+                ..Default::default()
+            },
+        );
+
+        // Unset: absolute computed fallback.
+        let info = job_to_proto(&job);
+        assert_eq!(info.stdout_path, "/home/alice/spur-42.out");
+        assert_eq!(info.stderr_path, "/home/alice/spur-42.out");
+
+        // Set: reported path wins.
+        job.actual_stdout_path = Some("/tmp/spur-42.out".into());
+        job.actual_stderr_path = Some("/tmp/spur-42.out".into());
+        let info = job_to_proto(&job);
+        assert_eq!(info.stdout_path, "/tmp/spur-42.out");
+        assert_eq!(info.stderr_path, "/tmp/spur-42.out");
     }
 
     fn make_node_info(name: &str) -> NodeInfo {

@@ -1569,6 +1569,19 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record the primary agent's resolved output paths for `scontrol`. Display-only
+    /// advisory metadata written straight to the in-memory job — not applied via a WAL
+    /// op (though it may ride along in a periodic snapshot), so a failover before the
+    /// next snapshot falls back to the computed path.
+    /// Empty paths stay `None` (a mixed-version agent decodes the fields as "").
+    pub fn set_job_output_paths(&self, job_id: JobId, stdout_path: String, stderr_path: String) {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            job.actual_stdout_path = (!stdout_path.is_empty()).then_some(stdout_path);
+            job.actual_stderr_path = (!stderr_path.is_empty()).then_some(stderr_path);
+        }
+    }
+
     /// Update node state (admin: drain, resume, etc.)
     ///
     /// When draining a node that still has running jobs, the state is set to
@@ -3109,6 +3122,9 @@ impl ClusterManager {
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.pending_reason = PendingReason::None;
+        // Stale after requeue (points at nodes the job left); next dispatch resets it.
+        job.actual_stdout_path = None;
+        job.actual_stderr_path = None;
     }
 
     /// Requeue after a dispatch failure or Timeout/NodeFail: counts against
@@ -6342,6 +6358,34 @@ mod tests {
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
+    }
+
+    // A cancelled job keeps its reported path (unlike requeue): the file was
+    // created there, so scontrol should still point at it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_preserves_output_path() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("cancel-me"));
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.actual_stdout_path.as_deref(), Some("/tmp/spur.out"));
+        assert_eq!(job.actual_stderr_path.as_deref(), Some("/tmp/spur.out"));
     }
 
     /// Drive a fresh job all the way to RUNNING on `node`, returning its id.
@@ -10261,6 +10305,10 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
+        // A reported path must not survive requeue (points at a node the job leaves).
+        cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
+        assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
+
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code: -1,
@@ -10293,6 +10341,24 @@ mod tests {
             "allocated_resources should be cleared"
         );
         assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(
+            job.actual_stdout_path.is_none() && job.actual_stderr_path.is_none(),
+            "stale reported output path should be cleared on requeue"
+        );
+    }
+
+    // Empty ("" from a mixed-version agent) must not shadow the computed fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_job_output_paths_ignores_empty() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("empty-paths"));
+
+        cm.set_job_output_paths(id, String::new(), String::new());
+        let job = cm.get_job(id).unwrap();
+        assert!(job.actual_stdout_path.is_none());
+        assert!(job.actual_stderr_path.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
